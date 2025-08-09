@@ -7,6 +7,7 @@ import streamlit as st
 from datetime import datetime
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 import yfinance as yf
+import pytz
 from streamlit_autorefresh import st_autorefresh
 
 # -------------------- App config --------------------
@@ -323,7 +324,8 @@ def screener_page():
     st.info(f"Scoring completed in {elapsed:.2f} seconds.")
 
     st.session_state.scored_df = df
-    st.session_state.last_refresh = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ist = pytz.timezone("Asia/Kolkata")
+    st.session_state.last_refresh = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
     legend_bar(st.session_state.last_refresh or latest)
     aggrid_table(df)
 
