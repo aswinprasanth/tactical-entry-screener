@@ -1,18 +1,22 @@
 import io
+import os
 import time
 import numpy as np
 import pandas as pd
 import streamlit as st
-from datetime import datetime, timedelta
+from datetime import datetime
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 import yfinance as yf
+from streamlit_autorefresh import st_autorefresh
 
+# -------------------- App config --------------------
 st.set_page_config(page_title="Tactical Entry Screener", layout="wide")
 
 APP_TITLE = "Tactical Entry Screener"
 USERNAME = "admin"
 PASSWORD = "Bct1bnco#"
 
+# Indicator thresholds/periods
 RSI_THRESHOLD = 30
 SMA_PERIOD = 50
 BB_PERIOD = 20
@@ -21,40 +25,22 @@ MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 
+# Weights
 WEIGHT_RSI = 30
 WEIGHT_BB = 35
 WEIGHT_52W_LOW = 20
 WEIGHT_SMA = 10
 WEIGHT_MACD = 5
 
+# -------------------- Session init --------------------
 if "auth" not in st.session_state:
     st.session_state.auth = False
-if "watchlist" not in st.session_state:
-    st.session_state.watchlist = pd.DataFrame({
-        "name": ["Tata Motors","ITC","Reliance","HDFC Bank"],
-        "ticker": ["TATAMOTORS.NS","ITC.NS","RELIANCE.NS","HDFCBANK.NS"]
-    })
 if "last_refresh" not in st.session_state:
     st.session_state.last_refresh = None
 if "scored_df" not in st.session_state:
     st.session_state.scored_df = pd.DataFrame()
 
-# --- Auto-refresh (uses streamlit-extras if present, else fallback) ---
-def _fallback_autorefresh(interval: int = 300000, key: str = "auto-refresh"):
-    import time, streamlit as st
-    now = time.time()
-    st.session_state.setdefault("_auto_refresh", {})
-    last = st.session_state["_auto_refresh"].get(key, 0.0)
-    # interval is ms
-    if now - last >= interval / 1000.0:
-        st.session_state["_auto_refresh"][key] = now
-        # Optional: clear caches so next run refetches
-        try:
-            fetch_history.clear()
-        except Exception:
-            pass
-        st.rerun()
-
+# -------------------- Auth --------------------
 def login_view():
     st.title(APP_TITLE)
     st.subheader("Login")
@@ -75,6 +61,7 @@ def logout_button():
         st.session_state.auth = False
         st.rerun()
 
+# -------------------- Indicators --------------------
 def compute_rsi(df, period=14):
     close = df["Close"]
     delta = close.diff()
@@ -83,8 +70,7 @@ def compute_rsi(df, period=14):
     avg_gain = gain.rolling(period).mean()
     avg_loss = loss.rolling(period).mean()
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    return 100 - (100 / (1 + rs))
 
 def compute_macd(df, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL):
     close = df["Close"]
@@ -103,14 +89,13 @@ def compute_bollinger_bands(df, period=BB_PERIOD, num_std=BB_STDDEV):
     lower_band = sma - num_std * std
     return upper_band, lower_band, sma
 
-@st.cache_data(show_spinner=False, ttl=300)
+# -------------------- Data + Scoring --------------------
+@st.cache_data(show_spinner=False, ttl=300)  # cache 5 min
 def fetch_history(ticker: str):
     t = yf.Ticker(ticker)
-    df = t.history(period="1y")
-    return df
+    return t.history(period="1y")
 
 def calculate_score(row):
-    import numpy as np
     score = 0
     if isinstance(row["RSI"], float) and np.isfinite(row["RSI"]) and row["RSI"] < RSI_THRESHOLD:
         score += WEIGHT_RSI * ((RSI_THRESHOLD - row["RSI"]) / RSI_THRESHOLD)
@@ -129,18 +114,33 @@ def calculate_score(row):
     return round(score, 2)
 
 def make_screener_link(ticker: str):
-    base = ticker.split(".")[0]
-    return f"https://www.screener.in/company/{base}/"
+    return f"https://www.screener.in/company/{ticker.split('.')[0]}/"
+
+def load_watchlist_from_csv(path: str = "stocks.csv") -> pd.DataFrame:
+    if not os.path.exists(path):
+        st.error(f"`{path}` not found in the app folder. Add it and reload.")
+        return pd.DataFrame(columns=["name", "ticker"])
+    try:
+        df = pd.read_csv(path)
+        df.columns = [c.strip().lower() for c in df.columns]
+        if "ticker" not in df.columns:
+            st.error("CSV must contain at least a `ticker` column.")
+            return pd.DataFrame(columns=["name", "ticker"])
+        if "name" not in df.columns:
+            df["name"] = df["ticker"]
+        df = df[["name", "ticker"]].fillna("").astype(str)
+        df = df[(df["name"] != "") & (df["ticker"] != "")]
+        return df.reset_index(drop=True)
+    except Exception as e:
+        st.error(f"Failed to read `{path}`: {e}")
+        return pd.DataFrame(columns=["name", "ticker"])
 
 def process_watchlist(df_in: pd.DataFrame):
-    import numpy as np
-    rows = []
-    latest_ts = []
-
+    rows, latest_ts = [], []
     for _, r in df_in.iterrows():
         name = str(r["name"]).strip()
         ticker = str(r["ticker"]).strip()
-        if not name or not ticker:
+        if not ticker:
             continue
         try:
             df = fetch_history(ticker)
@@ -172,8 +172,8 @@ def process_watchlist(df_in: pd.DataFrame):
             bb_ok = price <= bb_lower * 1.02 if np.isfinite(bb_lower) else False
             near_52w_low_ok = price <= week52_low * 1.1 if np.isfinite(week52_low) else False
 
-            row = {
-                "Stock": name,
+            rows.append({
+                "Stock": name or ticker,
                 "Ticker": ticker,
                 "Price": round(price, 2),
                 "Lower BB": round(bb_lower, 2) if np.isfinite(bb_lower) else np.nan,
@@ -182,21 +182,18 @@ def process_watchlist(df_in: pd.DataFrame):
                 "50D SMA": round(sma50, 2) if np.isfinite(sma50) else np.nan,
                 "MACD Hist": round(macd_hist, 4) if np.isfinite(macd_hist) else np.nan,
                 "Score": None,
-                "RSI_OK": rsi_ok,
-                "SMA_OK": sma_ok,
-                "MACD_OK": macd_ok,
-                "BB_OK": bb_ok,
-                "Near52wLow_OK": near_52w_low_ok,
+                "RSI_OK": rsi_ok, "SMA_OK": sma_ok, "MACD_OK": macd_ok,
+                "BB_OK": bb_ok, "Near52wLow_OK": near_52w_low_ok,
                 "Screener": make_screener_link(ticker),
-            }
-            rows.append(row)
+                "Current PE": pe_val,
+            })
         except Exception:
             rows.append({
-                "Stock": name, "Ticker": ticker,
+                "Stock": name or ticker, "Ticker": ticker,
                 "Price": "Error", "Lower BB": "Error", "RSI": "Error", "52W Low": "Error",
                 "50D SMA": "Error", "MACD Hist": "Error", "Score": None,
                 "RSI_OK": False, "SMA_OK": False, "MACD_OK": False, "BB_OK": False, "Near52wLow_OK": False,
-                "Screener": make_screener_link(ticker),
+                "Screener": make_screener_link(ticker), "Current PE": "Error",
             })
 
     out = pd.DataFrame(rows)
@@ -208,12 +205,29 @@ def process_watchlist(df_in: pd.DataFrame):
     latest = max(latest_ts).strftime('%Y-%m-%d %H:%M:%S') if latest_ts else None
     return out, latest
 
+# -------------------- UI helpers --------------------
+def scoring_reference():
+    with st.expander("Scoring Criteria & Weights", expanded=False):
+        st.markdown(
+            """
+| **Criteria** | **Description** | **Weightage** |
+|---|---|---|
+| RSI < 30 | Indicates oversold condition (lower RSI gets higher score) | 30 |
+| Price near/below Lower BB | Proximity to lower Bollinger Band suggests support levels | 35 |
+| Near 52-Week Low | Stock is close to its 52-week low (scaled within 10%) | 20 |
+| Price < 50D SMA | Price trading below 50-day moving average | 10 |
+| MACD Histogram > 0 | Bullish crossover indication (binary) | 5 |
+
+**Entry Score:** Weighted sum based on how strongly a stock meets each condition. Higher scores indicate better alignment with value-entry signals.
+            """
+        )
+
 def legend_bar(last_refresh_str: str | None):
     st.markdown(
         """
 <style>
 .legend { display: flex; gap: 18px; align-items: center; font-size: 14px; color: #444; margin-bottom: 8px; }
-.badge { padding: 2px 8px; border-radius: 6px; border: 1px solid #ddd; background: #fafafa; }
+.badge { padding: 2px 8px; border-radius: 6px; border: 1px solid #bbb; background: #f3f4f6; font-weight: 600; }
 </style>
 """,
         unsafe_allow_html=True,
@@ -233,17 +247,21 @@ def legend_bar(last_refresh_str: str | None):
 def aggrid_table(df: pd.DataFrame):
     view_cols = ["Stock","Price","Lower BB","RSI","52W Low","50D SMA","MACD Hist","Score","Screener"]
     gb = GridOptionsBuilder.from_dataframe(df[view_cols])
+
     gb.configure_column("Screener", header_name="Screener", cellRenderer=JsCode("""
         class UrlCellRenderer {
           init(params) { this.eGui = document.createElement('a'); this.eGui.href = params.value; this.eGui.innerText = 'Open'; this.eGui.target = '_blank'; }
           getGui() { return this.eGui; }
         }
     """))
+
     style_fn = JsCode("""
 function(params){
   const row = params.data || {}; const val = params.value;
   const isErr = (v) => String(v).toLowerCase() === 'error';
-  const green = {'backgroundColor':'#e8f5e9'}; const red = {'backgroundColor':'#ffebee'}; const grey = {'backgroundColor':'#eeeeee'};
+  const green = {'backgroundColor':'#86efac', 'fontWeight':'600'};
+  const red   = {'backgroundColor':'#fca5a5', 'fontWeight':'600'};
+  const grey  = {'backgroundColor':'#e5e7eb', 'fontWeight':'600'};
   const col = params.colDef.field;
   if (['RSI','50D SMA','MACD Hist','Lower BB','52W Low'].includes(col)){
     if (isErr(val)) return grey;
@@ -258,7 +276,19 @@ function(params){
 """)
     for c in ["RSI","50D SMA","MACD Hist","Lower BB","52W Low"]:
         gb.configure_column(c, cellStyle=style_fn)
-    gb.configure_grid_options(domLayout="autoHeight", enableCellTextSelection=True)
+
+    # Row demarcation for high-score ideas (>= 60)
+    row_style_fn = JsCode("""
+function(params) {
+  const s = Number(params.data && params.data.Score);
+  if (!isNaN(s) && s >= 60) {
+    return {'backgroundColor': '#fff3cd', 'fontWeight': '700'}; // light yellow + bold
+  }
+  return {};
+}
+""")
+
+    gb.configure_grid_options(domLayout="autoHeight", enableCellTextSelection=True, getRowStyle=row_style_fn)
     grid_options = gb.build()
 
     AgGrid(
@@ -271,87 +301,45 @@ function(params){
         height=460
     )
 
-def manage_watchlist_page():
-    st.header("Manage Watchlist")
-    st.caption("Upload, view, and edit your stocks list (name, ticker). Save to persist in session and download as CSV.")
-    col1, col2, col3 = st.columns([2,1,1])
-    with col1:
-        file = st.file_uploader("Upload stocks.csv", type=["csv"])
-    with col2:
-        if st.button("Download current CSV"):
-            csv_buf = io.StringIO()
-            st.session_state.watchlist.to_csv(csv_buf, index=False)
-            st.download_button("Click to download", data=csv_buf.getvalue(), file_name="stocks.csv", mime="text/csv", key="dlbtn")
-    with col3:
-        if st.button("Add blank row"):
-            st.session_state.watchlist.loc[len(st.session_state.watchlist)] = {"name":"","ticker":""}
-
-    st.write("Edit below and click **Save changes**")
-    edited = st.data_editor(
-        st.session_state.watchlist,
-        num_rows="dynamic",
-        use_container_width=True,
-        key="editor"
-    )
-
-    save = st.button("Save changes")
-    if save:
-        edited = edited.fillna("")
-        edited["name"] = edited["name"].astype(str).str.strip()
-        edited["ticker"] = edited["ticker"].astype(str).str.strip()
-        edited = edited[(edited["name"]!="") & (edited["ticker"]!="")]
-        st.session_state.watchlist = edited.reset_index(drop=True)
-        st.success("Watchlist updated.")
-
-    st.markdown(
-        """
-**CSV format**
-```
-name,ticker
-Tata Motors,TATAMOTORS.NS
-ITC,ITC.NS
-Reliance,RELIANCE.NS
-HDFC Bank,HDFCBANK.NS
-```
-"""
-    )
-
+# -------------------- Page --------------------
 def screener_page():
     st.header("Screener")
-    _fallback_autorefresh(interval=300000, key="auto-refresh") # 5 min
+    scoring_reference()
 
-    run = st.button("Refresh now")
-    if run:
+    # Auto-refresh every 1 minute; session is preserved (no logout)
+    st_autorefresh(interval=300*1000, key="data-refresh")
+
+    watchlist = load_watchlist_from_csv("stocks.csv")
+    if watchlist.empty:
+        st.stop()
+
+    if st.button("Refresh now"):
         fetch_history.clear()
 
+    start_time = time.time()
     with st.spinner("Scoring… this uses cached data (5 min TTL)"):
-        df, latest = process_watchlist(st.session_state.watchlist)
+        df, latest = process_watchlist(watchlist)
+    elapsed = time.time() - start_time
+    st.info(f"Scoring completed in {elapsed:.2f} seconds.")
 
     st.session_state.scored_df = df
     st.session_state.last_refresh = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    legend_bar(st.session_state.last_refresh if st.session_state.last_refresh else latest)
+    legend_bar(st.session_state.last_refresh or latest)
     aggrid_table(df)
 
     csv_buf = io.StringIO()
     df.to_csv(csv_buf, index=False)
     st.download_button("Download results CSV", data=csv_buf.getvalue(), file_name="screener_results.csv", mime="text/csv")
 
+# -------------------- Main --------------------
 def main():
     if not st.session_state.auth:
         login_view()
         return
 
-    if st.sidebar.button("Log out"):
-        st.session_state.auth = False
-        st.rerun()
-
     st.sidebar.title(APP_TITLE)
-    page = st.sidebar.radio("Navigate", ["Screener","Manage Watchlist"])
-
-    if page == "Screener":
-        screener_page()
-    elif page == "Manage Watchlist":
-        manage_watchlist_page()
+    logout_button()
+    screener_page()
 
 if __name__ == "__main__":
     main()
