@@ -39,6 +39,22 @@ if "last_refresh" not in st.session_state:
 if "scored_df" not in st.session_state:
     st.session_state.scored_df = pd.DataFrame()
 
+# --- Auto-refresh (uses streamlit-extras if present, else fallback) ---
+def _fallback_autorefresh(interval: int = 300000, key: str = "auto-refresh"):
+    import time, streamlit as st
+    now = time.time()
+    st.session_state.setdefault("_auto_refresh", {})
+    last = st.session_state["_auto_refresh"].get(key, 0.0)
+    # interval is ms
+    if now - last >= interval / 1000.0:
+        st.session_state["_auto_refresh"][key] = now
+        # Optional: clear caches so next run refetches
+        try:
+            fetch_history.clear()
+        except Exception:
+            pass
+        st.rerun()
+
 def login_view():
     st.title(APP_TITLE)
     st.subheader("Login")
@@ -302,7 +318,7 @@ HDFC Bank,HDFCBANK.NS
 
 def screener_page():
     st.header("Screener")
-    st.autorefresh(interval=300000, key="auto-refresh")  # 5 min
+    _fallback_autorefresh(interval=300000, key="auto-refresh") # 5 min
 
     run = st.button("Refresh now")
     if run:
